@@ -4677,7 +4677,9 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
     char *line = NULL;
     size_t cap = 0;
+#ifndef _WIN32
     int fd = cbm_fileno(in);
+#endif
 
     for (;;) {
         /* Poll with idle timeout so we can evict unused stores between requests.
@@ -4698,18 +4700,7 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
          *            when the FILE* buffer is empty, which would otherwise
          *            bypass the Phase 3 idle eviction timeout.
          *   Phase 3: only if both phases confirm no data, do blocking poll. */
-#ifdef _WIN32
-        /* Windows: WaitForSingleObject on stdin handle */
-        HANDLE hStdin = (HANDLE)_get_osfhandle(fd);
-        DWORD wr = WaitForSingleObject(hStdin, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
-        if (wr == WAIT_FAILED) {
-            break;
-        }
-        if (wr == WAIT_TIMEOUT) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
-            continue;
-        }
-#else
+#ifndef _WIN32
         int pr = poll_for_input_unix(srv, fd, in);
         if (pr < 0) {
             break;
