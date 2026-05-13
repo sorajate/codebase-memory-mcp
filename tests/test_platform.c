@@ -3,7 +3,11 @@
  */
 #include "test_framework.h"
 #include "../src/foundation/platform.h"
-#include <unistd.h>
+#include "../src/foundation/process_lock.h"
+#include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
+#include <stdio.h>
+#include <time.h>
 
 TEST(platform_now_ns) {
     uint64_t t1 = cbm_now_ns();
@@ -68,6 +72,22 @@ TEST(platform_mmap_nonexistent) {
     PASS();
 }
 
+TEST(process_lock_try_contention) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/cbm_process_lock_%ld.lock", cbm_tmpdir(), (long)time(NULL));
+    cbm_process_lock_t *a = NULL;
+    cbm_process_lock_t *b = NULL;
+    ASSERT_EQ(cbm_process_lock_acquire(path, &a), 0);
+    ASSERT_NOT_NULL(a);
+    ASSERT_NEQ(cbm_process_lock_try_acquire(path, &b), 0);
+    ASSERT_NULL(b);
+    cbm_process_lock_release(a);
+    ASSERT_EQ(cbm_process_lock_try_acquire(path, &b), 0);
+    cbm_process_lock_release(b);
+    cbm_unlink(path);
+    PASS();
+}
+
 SUITE(platform) {
     RUN_TEST(platform_now_ns);
     RUN_TEST(platform_now_ms);
@@ -77,4 +97,5 @@ SUITE(platform) {
     RUN_TEST(platform_file_size);
     RUN_TEST(platform_mmap);
     RUN_TEST(platform_mmap_nonexistent);
+    RUN_TEST(process_lock_try_contention);
 }

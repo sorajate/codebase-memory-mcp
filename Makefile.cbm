@@ -108,6 +108,7 @@ FOUNDATION_SRCS = \
     src/foundation/compat_regex.c \
     src/foundation/mem.c \
     src/foundation/diagnostics.c \
+    src/foundation/process_lock.c \
     src/foundation/profile.c
 
 # Existing extraction C code (compiled from current location)

@@ -333,7 +333,7 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 
 | Agent | MCP Config | Instructions | Hooks |
 |-------|-----------|-------------|-------|
-| Claude Code | `.claude/.mcp.json` | 4 Skills | PreToolUse (Grep/Glob/Read reminder) |
+| Claude Code | `.claude/.mcp.json` | 4 Skills | PreToolUse + SessionStart |
 | Codex CLI | `.codex/config.toml` | `.codex/AGENTS.md` | — |
 | Gemini CLI | `.gemini/settings.json` | `.gemini/GEMINI.md` | BeforeTool (grep/read reminder) |
 | Zed | `settings.json` (JSONC) | — | — |
@@ -345,7 +345,7 @@ Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` 
 | OpenClaw | `openclaw.json` | — | — |
 | Kiro | `.kiro/settings/mcp.json` | — | — |
 
-**Hooks** are advisory (exit code 0) — they remind agents to prefer MCP graph tools when they reach for grep/glob/read, without blocking the tool call.
+**Hooks** are advisory (exit code 0) — they remind agents to prefer MCP graph tools when they reach for grep/glob/read, without blocking the tool call. On Windows, the installer configures hooks to call `codebase-memory-mcp hook ...` directly instead of relying on Unix-style script paths, so the same Claude/Cursor-compatible hook config works without the Windows "Open with" prompt.
 
 ## CLI Mode
 

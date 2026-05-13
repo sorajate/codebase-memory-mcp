@@ -42,6 +42,7 @@ typedef struct {
     int file_count;            /* approximate, for interval calc */
     int interval_ms;           /* adaptive poll interval */
     int64_t next_poll_ns;      /* next poll time (monotonic ns) */
+    int64_t change_seen_ns;    /* first detected change waiting for quiet window */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -65,6 +66,7 @@ struct cbm_watcher {
 #define POLL_BASE_MS 5000
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
 #define POLL_MAX_MS 60000
+#define QUIET_WINDOW_MS 2000
 
 /* Sleep chunk for responsive shutdown (ms) */
 #define SLEEP_CHUNK_MS 500
@@ -416,7 +418,20 @@ static void poll_project(const char *key, void *val, void *ud) {
     /* Check for changes */
     bool changed = check_changes(s);
     if (!changed) {
+        s->change_seen_ns = 0;
         s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+        return;
+    }
+
+    if (s->change_seen_ns == 0) {
+        s->change_seen_ns = ctx->now;
+        s->next_poll_ns = ctx->now + ((int64_t)QUIET_WINDOW_MS * US_PER_MS);
+        cbm_log_info("watcher.debounce", "project", s->project_name, "quiet_ms", "2000");
+        return;
+    }
+
+    if (ctx->now - s->change_seen_ns < ((int64_t)QUIET_WINDOW_MS * US_PER_MS)) {
+        s->next_poll_ns = s->change_seen_ns + ((int64_t)QUIET_WINDOW_MS * US_PER_MS);
         return;
     }
 
@@ -426,6 +441,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
+            s->change_seen_ns = 0;
             /* Update HEAD after successful reindex */
             git_head(s->root_path, s->last_head, sizeof(s->last_head));
             /* Refresh file count for interval */

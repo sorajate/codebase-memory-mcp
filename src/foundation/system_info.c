@@ -34,7 +34,9 @@ enum { DEFAULT_CORES = 1, MIN_WORKERS = 1 };
 
 /* ── macOS detection ─────────────────────────────────────────────── */
 
-#ifdef __APPLE__
+#if defined(_WIN32)
+/* Windows implementation is below. */
+#elif defined(__APPLE__)
 
 static int sysctl_int(const char *name, int fallback) {
     int val = 0;

@@ -32,6 +32,15 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24, INCR_WAL_BUF = 1
 #include <sys/stat.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#ifdef _WIN32
+#include <process.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 /* ── Constants ───────────────────────────────────────────────────── */
 
@@ -68,6 +77,57 @@ static int64_t stat_mtime_ns(const struct stat *st) {
 #else
     return ((int64_t)st->st_mtim.tv_sec * CBM_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
 #endif
+}
+
+static void unlink_db_sidecars(const char *db_path) {
+    char wal[INCR_WAL_BUF];
+    char shm[INCR_WAL_BUF];
+    snprintf(wal, sizeof(wal), "%s-wal", db_path);
+    snprintf(shm, sizeof(shm), "%s-shm", db_path);
+    cbm_unlink(wal);
+    cbm_unlink(shm);
+}
+
+static void cleanup_temp_db(const char *db_path) {
+    cbm_unlink(db_path);
+    unlink_db_sidecars(db_path);
+}
+
+static int make_temp_db_path(const char *final_path, char *tmp_path, size_t tmp_path_sz) {
+    static atomic_uint counter = 0;
+#ifdef _WIN32
+    int pid = _getpid();
+#else
+    int pid = (int)getpid();
+#endif
+    unsigned int n = atomic_fetch_add(&counter, 1);
+    int wrote = snprintf(tmp_path, tmp_path_sz, "%s.tmp.%d.%u", final_path, pid, n);
+    return (wrote > 0 && (size_t)wrote < tmp_path_sz) ? 0 : CBM_NOT_FOUND;
+}
+
+static int atomic_replace_db(const char *tmp_path, const char *final_path) {
+    unlink_db_sidecars(final_path);
+#ifdef _WIN32
+    if (!MoveFileExA(tmp_path, final_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return CBM_NOT_FOUND;
+    }
+#else
+    if (rename(tmp_path, final_path) != 0) {
+        return CBM_NOT_FOUND;
+    }
+#endif
+    unlink_db_sidecars(final_path);
+    return 0;
+}
+
+static int validate_db_file(const char *db_path) {
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return CBM_NOT_FOUND;
+    }
+    bool ok = cbm_store_check_integrity(store);
+    cbm_store_close(store);
+    return ok ? 0 : CBM_NOT_FOUND;
 }
 
 /* ── File classification ─────────────────────────────────────────── */
@@ -461,26 +521,28 @@ static void run_postpasses(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed_fil
  * Mode-skipped hash rows are preserved across the rebuild so subsequent
  * reindexes can correctly distinguish "never indexed" from "indexed but
  * not visited this pass". */
-static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
-                             cbm_file_info_t *files, int file_count,
-                             const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
-                             const char *repo_path) {
+static int dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *project,
+                            cbm_file_info_t *files, int file_count,
+                            const cbm_file_hash_t *mode_skipped, int mode_skipped_count,
+                            const char *repo_path) {
     struct timespec t;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t);
 
-    cbm_unlink(db_path);
-    char wal[INCR_WAL_BUF];
-    char shm[INCR_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    char tmp_path[CBM_SZ_1K];
+    if (make_temp_db_path(db_path, tmp_path, sizeof(tmp_path)) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    cleanup_temp_db(tmp_path);
 
-    int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, db_path);
+    int dump_rc = cbm_gbuf_dump_to_sqlite(gbuf, tmp_path);
     cbm_log_info("incremental.dump", "rc", itoa_buf(dump_rc), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t)));
+    if (dump_rc != 0) {
+        cleanup_temp_db(tmp_path);
+        return dump_rc;
+    }
 
-    cbm_store_t *hash_store = cbm_store_open_path(db_path);
+    cbm_store_t *hash_store = cbm_store_open_path(tmp_path);
     if (hash_store) {
         persist_hashes(hash_store, project, files, file_count, mode_skipped, mode_skipped_count);
 
@@ -498,13 +560,31 @@ static void dump_and_persist(cbm_gbuf_t *gbuf, const char *db_path, const char *
                            "SELECT id, name, qualified_name, label, file_path FROM nodes;");
         }
 
+        cbm_store_checkpoint(hash_store);
+        cbm_store_exec(hash_store, "PRAGMA wal_checkpoint(FULL);");
+        cbm_store_exec(hash_store, "PRAGMA journal_mode = DELETE;");
         cbm_store_close(hash_store);
+    } else {
+        cleanup_temp_db(tmp_path);
+        return CBM_NOT_FOUND;
+    }
+
+    if (validate_db_file(tmp_path) != 0) {
+        cleanup_temp_db(tmp_path);
+        return CBM_NOT_FOUND;
+    }
+    unlink_db_sidecars(tmp_path);
+
+    if (atomic_replace_db(tmp_path, db_path) != 0) {
+        cleanup_temp_db(tmp_path);
+        return CBM_NOT_FOUND;
     }
 
     /* Auto-update artifact if one already exists (persistence was enabled previously) */
     if (repo_path && cbm_artifact_exists(repo_path)) {
         cbm_artifact_export(db_path, repo_path, project, CBM_ARTIFACT_FAST);
     }
+    return 0;
 }
 
 /* ── Incremental pipeline entry point ────────────────────────────── */
@@ -654,10 +734,13 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
      * reindex can correctly classify those files instead of seeing them
      * as never-existed; also exports a fast-mode artifact when one is
      * already present alongside the repo). */
-    dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
-                     mode_skipped_count, cbm_pipeline_repo_path(p));
+    int dump_rc = dump_and_persist(existing, db_path, project, files, file_count, mode_skipped,
+                                   mode_skipped_count, cbm_pipeline_repo_path(p));
     free_mode_skipped(mode_skipped, mode_skipped_count);
     cbm_gbuf_free(existing);
+    if (dump_rc != 0) {
+        return dump_rc;
+    }
 
     cbm_log_info("incremental.done", "elapsed_ms", itoa_buf((int)elapsed_ms(t0)));
     return 0;

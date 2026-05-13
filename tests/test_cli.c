@@ -22,6 +22,17 @@
 #include <errno.h>
 #include <zlib.h>
 
+#ifdef _WIN32
+#include <io.h>
+#define TEST_DUP _dup
+#define TEST_DUP2 _dup2
+#define TEST_FILENO _fileno
+#else
+#define TEST_DUP dup
+#define TEST_DUP2 dup2
+#define TEST_FILENO fileno
+#endif
+
 /* Helper: create a file with content */
 static int write_test_file(const char *path, const char *content) {
     FILE *f = fopen(path, "w");
@@ -61,6 +72,45 @@ static int test_mkdirp(const char *path) {
 /* Helper: recursive remove */
 static void test_rmdir_r(const char *path) {
     th_rmtree(path);
+}
+
+static char *capture_stdout_of_cli(int (*fn)(int, char **), int argc, char **argv) {
+    fflush(stdout);
+    FILE *tmp = tmpfile();
+    if (!tmp)
+        return NULL;
+    int saved = TEST_DUP(TEST_FILENO(stdout));
+    if (saved < 0) {
+        fclose(tmp);
+        return NULL;
+    }
+    if (TEST_DUP2(TEST_FILENO(tmp), TEST_FILENO(stdout)) < 0) {
+        close(saved);
+        fclose(tmp);
+        return NULL;
+    }
+
+    (void)fn(argc, argv);
+    fflush(stdout);
+    TEST_DUP2(saved, TEST_FILENO(stdout));
+    close(saved);
+
+    fseek(tmp, 0, SEEK_END);
+    long len = ftell(tmp);
+    fseek(tmp, 0, SEEK_SET);
+    if (len < 0) {
+        fclose(tmp);
+        return NULL;
+    }
+    char *buf = malloc((size_t)len + 1);
+    if (!buf) {
+        fclose(tmp);
+        return NULL;
+    }
+    size_t n = fread(buf, 1, (size_t)len, tmp);
+    buf[n] = '\0';
+    fclose(tmp);
+    return buf;
 }
 
 /* Helper: create tar.gz with a single file */
@@ -386,6 +436,35 @@ TEST(cli_find_cli_fallback_paths) {
     test_rmdir_r(tmpdir);
     PASS();
 }
+
+#ifdef _WIN32
+TEST(cli_find_cli_on_path_windows_cmd) {
+    char *tmpdir = th_mktempdir("cli-find-win");
+    if (!tmpdir)
+        SKIP("cbm_mkdtemp failed");
+
+    char fakecli[1024];
+    snprintf(fakecli, sizeof(fakecli), "%s/opencode.cmd", tmpdir);
+    ASSERT_EQ(th_write_file(fakecli, "@echo off\r\n"), 0);
+
+    const char *raw = getenv("PATH");
+    char *old_path = raw ? strdup(raw) : NULL;
+    cbm_setenv("PATH", tmpdir, 1);
+
+    const char *result = cbm_find_cli("opencode", tmpdir);
+    ASSERT(result[0] != '\0');
+    ASSERT(strstr(result, "opencode.cmd") != NULL);
+
+    if (old_path) {
+        cbm_setenv("PATH", old_path, 1);
+        free(old_path);
+    } else {
+        cbm_unsetenv("PATH");
+    }
+    th_cleanup(tmpdir);
+    PASS();
+}
+#endif
 
 /* ═══════════════════════════════════════════════════════════════════
  *  Dry-run flag parsing (port of TestDryRun)
@@ -1534,6 +1613,234 @@ TEST(cli_detect_agents_none_found) {
     PASS();
 }
 
+TEST(cli_detect_agents_finds_opencode_config) {
+    char *tmpdir = th_mktempdir("cli-opencode");
+    if (!tmpdir)
+        SKIP("cbm_mkdtemp failed");
+
+    char configpath[1024];
+    snprintf(configpath, sizeof(configpath), "%s/.config/opencode/opencode.json", tmpdir);
+    ASSERT_EQ(th_write_file(configpath, "{}\n"), 0);
+
+    const char *raw = getenv("PATH");
+    char *old_path = raw ? strdup(raw) : NULL;
+    cbm_setenv("PATH", "", 1);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.opencode);
+
+    if (old_path) {
+        cbm_setenv("PATH", old_path, 1);
+        free(old_path);
+    } else {
+        cbm_unsetenv("PATH");
+    }
+    th_cleanup(tmpdir);
+    PASS();
+}
+
+TEST(cli_detect_agents_finds_opencode_config_env_override) {
+    char *tmpdir = th_mktempdir("cli-opencode-env");
+    if (!tmpdir)
+        SKIP("cbm_mkdtemp failed");
+
+    char cfgdir[1024];
+    char cfgpath[1024];
+    snprintf(cfgdir, sizeof(cfgdir), "%s/custom-opencode", tmpdir);
+    snprintf(cfgpath, sizeof(cfgpath), "%s/opencode.json", cfgdir);
+    ASSERT_EQ(th_write_file(cfgpath, "{}\n"), 0);
+
+    const char *raw_cfg = getenv("OPENCODE_CONFIG_DIR");
+    char *old_cfg = raw_cfg ? strdup(raw_cfg) : NULL;
+    cbm_setenv("OPENCODE_CONFIG_DIR", cfgdir, 1);
+
+    const char *raw_path = getenv("PATH");
+    char *old_path = raw_path ? strdup(raw_path) : NULL;
+    cbm_setenv("PATH", "", 1);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    ASSERT_TRUE(agents.opencode);
+
+    if (old_cfg) {
+        cbm_setenv("OPENCODE_CONFIG_DIR", old_cfg, 1);
+        free(old_cfg);
+    } else {
+        cbm_unsetenv("OPENCODE_CONFIG_DIR");
+    }
+    if (old_path) {
+        cbm_setenv("PATH", old_path, 1);
+        free(old_path);
+    } else {
+        cbm_unsetenv("PATH");
+    }
+    th_cleanup(tmpdir);
+    PASS();
+}
+
+TEST(cli_cmd_install_only_opencode_dry_run) {
+    char *tmpdir = th_mktempdir("cli-install-opencode");
+    if (!tmpdir)
+        SKIP("cbm_mkdtemp failed");
+
+    char opcfg[1024];
+    snprintf(opcfg, sizeof(opcfg), "%s/.config/opencode/opencode.json", tmpdir);
+    ASSERT_EQ(th_write_file(opcfg, "{}\n"), 0);
+
+    const char *raw_home = getenv("HOME");
+    char *old_home = raw_home ? strdup(raw_home) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char *argv[] = {"install", "--dry-run", "--only", "opencode", "-y", NULL};
+    char *out = capture_stdout_of_cli(cbm_cmd_install, 5, argv);
+    ASSERT_NOT_NULL(out);
+    ASSERT(strstr(out, "Detected agents: OpenCode") != NULL);
+    ASSERT(strstr(out, "OpenCode:") != NULL);
+    ASSERT(strstr(out, "Codex CLI:") == NULL);
+    ASSERT(strstr(out, "Gemini CLI:") == NULL);
+    free(out);
+
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    th_cleanup(tmpdir);
+    PASS();
+}
+
+TEST(cli_cmd_install_config_only_skips_path_output) {
+    char *tmpdir = th_mktempdir("cli-config-only");
+    if (!tmpdir)
+        SKIP("cbm_mkdtemp failed");
+
+    char opcfg[1024];
+    snprintf(opcfg, sizeof(opcfg), "%s/.config/opencode/opencode.json", tmpdir);
+    ASSERT_EQ(th_write_file(opcfg, "{}\n"), 0);
+
+    const char *raw_home = getenv("HOME");
+    char *old_home = raw_home ? strdup(raw_home) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char *argv[] = {"install", "--dry-run", "--config-only", "--only", "opencode", "-y",
+                    NULL};
+    char *out = capture_stdout_of_cli(cbm_cmd_install, 6, argv);
+    ASSERT_NOT_NULL(out);
+    ASSERT(strstr(out, "OpenCode:") != NULL);
+    ASSERT(strstr(out, "PATH already includes") == NULL);
+    ASSERT(strstr(out, "Added ") == NULL);
+    free(out);
+
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    th_cleanup(tmpdir);
+    PASS();
+}
+
+#ifdef _WIN32
+TEST(cli_cmd_install_claude_windows_migrates_legacy_hooks) {
+    char *tmpdir = th_mktempdir("cli-claude-win-hooks");
+    if (!tmpdir)
+        SKIP("cbm_mkdtemp failed");
+
+    ASSERT_EQ(th_mkdir_p(TH_PATH(tmpdir, ".claude")), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, ".claude/settings.json"),
+                            "{\n"
+                            "  \"hooks\": {\n"
+                            "    \"PreToolUse\": [\n"
+                            "      {\n"
+                            "        \"matcher\": \"Grep|Glob|Read|Search\",\n"
+                            "        \"hooks\": [{\"type\": \"command\", \"command\": \"~/.claude/hooks/cbm-code-discovery-gate\"}]\n"
+                            "      }\n"
+                            "    ],\n"
+                            "    \"SessionStart\": [\n"
+                            "      {\n"
+                            "        \"matcher\": \"startup\",\n"
+                            "        \"hooks\": [{\"type\": \"command\", \"command\": \"~/.claude/hooks/cbm-session-reminder\"}]\n"
+                            "      }\n"
+                            "    ]\n"
+                            "  }\n"
+                            "}\n"),
+              0);
+
+    const char *raw_home = getenv("HOME");
+    char *old_home = raw_home ? strdup(raw_home) : NULL;
+    const char *raw_userprofile = getenv("USERPROFILE");
+    char *old_userprofile = raw_userprofile ? strdup(raw_userprofile) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("USERPROFILE", tmpdir, 1);
+
+    char *dry_run_argv[] = {"install", "--dry-run", "--only", "claude-code", "-y", NULL};
+    char *out = capture_stdout_of_cli(cbm_cmd_install, 5, dry_run_argv);
+    ASSERT_NOT_NULL(out);
+    ASSERT(strstr(out, "Claude Code:") != NULL);
+    ASSERT(strstr(out, "hooks: PreToolUse") != NULL);
+    free(out);
+
+    char *install_argv[] = {"install", "--only", "claude-code", "-y", NULL};
+    ASSERT_EQ(cbm_cmd_install(4, install_argv), 0);
+
+    const char *data = read_test_file(TH_PATH(tmpdir, ".claude/settings.json"));
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "~/.claude/hooks/cbm-code-discovery-gate") == NULL);
+    ASSERT(strstr(data, "~/.claude/hooks/cbm-session-reminder") == NULL);
+    ASSERT(strstr(data, "SessionStart") != NULL);
+    ASSERT(strstr(data, "hook discovery-gate") != NULL);
+    ASSERT(strstr(data, "hook session-reminder") != NULL);
+
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    if (old_userprofile) {
+        cbm_setenv("USERPROFILE", old_userprofile, 1);
+        free(old_userprofile);
+    } else {
+        cbm_unsetenv("USERPROFILE");
+    }
+
+    th_cleanup(tmpdir);
+    PASS();
+}
+#endif
+
+TEST(cli_cmd_uninstall_only_opencode_dry_run) {
+    char *tmpdir = th_mktempdir("cli-uninstall-opencode");
+    if (!tmpdir)
+        SKIP("cbm_mkdtemp failed");
+
+    char opcfg[1024];
+    snprintf(opcfg, sizeof(opcfg), "%s/.config/opencode/opencode.json", tmpdir);
+    ASSERT_EQ(th_write_file(opcfg, "{}\n"), 0);
+
+    const char *raw_home = getenv("HOME");
+    char *old_home = raw_home ? strdup(raw_home) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+
+    char *argv[] = {"uninstall", "--dry-run", "--only", "opencode", "-y", NULL};
+    char *out = capture_stdout_of_cli(cbm_cmd_uninstall, 5, argv);
+    ASSERT_NOT_NULL(out);
+    ASSERT(strstr(out, "OpenCode: removed MCP config entry") != NULL);
+    ASSERT(strstr(out, "Codex CLI") == NULL);
+    ASSERT(strstr(out, "Gemini CLI") == NULL);
+    free(out);
+
+    if (old_home) {
+        cbm_setenv("HOME", old_home, 1);
+        free(old_home);
+    } else {
+        cbm_unsetenv("HOME");
+    }
+    th_cleanup(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group B: MCP Config Upsert — Codex TOML
  * ═══════════════════════════════════════════════════════════════════ */
@@ -1686,6 +1993,76 @@ TEST(cli_upsert_opencode_mcp_existing) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "other-server") != NULL);
     ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_upsert_opencode_instructions_ref_fresh) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ocode-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/opencode.json", tmpdir);
+
+    int rc = cbm_upsert_opencode_instructions_ref(configpath,
+                                                  "~/.config/opencode/instructions/codebase-memory-mcp.md");
+    ASSERT_EQ(rc, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "\"instructions\"") != NULL);
+    ASSERT(strstr(data, "codebase-memory-mcp.md") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_upsert_opencode_instructions_ref_preserves_existing) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ocode-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/opencode.json", tmpdir);
+    write_test_file(configpath,
+                    "{\"instructions\":[\"~/.config/opencode/instructions/morph-tools.md\"]}");
+
+    int rc = cbm_upsert_opencode_instructions_ref(configpath,
+                                                  "~/.config/opencode/instructions/codebase-memory-mcp.md");
+    ASSERT_EQ(rc, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "morph-tools.md") != NULL);
+    ASSERT(strstr(data, "codebase-memory-mcp.md") != NULL);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_remove_opencode_instructions_ref) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-ocode-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        SKIP("cbm_mkdtemp failed");
+
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/opencode.json", tmpdir);
+    write_test_file(configpath,
+                    "{\"instructions\":[\"~/.config/opencode/instructions/morph-tools.md\",\"~/.config/opencode/instructions/codebase-memory-mcp.md\"]}");
+
+    int rc = cbm_remove_opencode_instructions_ref(configpath,
+                                                  "~/.config/opencode/instructions/codebase-memory-mcp.md");
+    ASSERT_EQ(rc, 0);
+
+    const char *data = read_test_file(configpath);
+    ASSERT_NOT_NULL(data);
+    ASSERT(strstr(data, "morph-tools.md") != NULL);
+    ASSERT(strstr(data, "codebase-memory-mcp.md") == NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -1908,7 +2285,7 @@ TEST(cli_upsert_claude_hook_fresh) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "PreToolUse") != NULL);
     ASSERT(strstr(data, "Grep|Glob|Read") != NULL);
-    ASSERT(strstr(data, "cbm-code-discovery-gate") != NULL);
+    ASSERT(strstr(data, "hook discovery-gate") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -1962,7 +2339,7 @@ TEST(cli_upsert_claude_hook_replace) {
     ASSERT_NOT_NULL(data);
     /* Old message gone, new hook script path present */
     ASSERT(strstr(data, "old-cmm-message") == NULL);
-    ASSERT(strstr(data, "cbm-code-discovery-gate") != NULL);
+    ASSERT(strstr(data, "hook discovery-gate") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -2037,7 +2414,7 @@ TEST(cli_upsert_gemini_hook_fresh) {
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "BeforeTool") != NULL);
-    ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "hook gemini-reminder") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -2061,7 +2438,7 @@ TEST(cli_upsert_gemini_hook_existing) {
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
     /* Our hook added */
-    ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "hook gemini-reminder") != NULL);
     /* Existing hook preserved */
     ASSERT(strstr(data, "shell") != NULL);
 
@@ -2088,7 +2465,7 @@ TEST(cli_upsert_gemini_hook_replace) {
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "old-cmm") == NULL);
-    ASSERT(strstr(data, "codebase-memory-mcp") != NULL);
+    ASSERT(strstr(data, "hook gemini-reminder") != NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -2109,7 +2486,7 @@ TEST(cli_remove_gemini_hooks) {
 
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
-    ASSERT(strstr(data, "codebase-memory-mcp") == NULL);
+    ASSERT(strstr(data, "hook gemini-reminder") == NULL);
 
     test_rmdir_r(tmpdir);
     PASS();
@@ -2372,6 +2749,9 @@ SUITE(cli) {
     RUN_TEST(cli_find_cli_not_found);
     RUN_TEST(cli_find_cli_on_path);
     RUN_TEST(cli_find_cli_fallback_paths);
+#ifdef _WIN32
+    RUN_TEST(cli_find_cli_on_path_windows_cmd);
+#endif
 
     /* Dry-run flag parsing (1 test — install_test.go) */
     RUN_TEST(cli_dry_run_flags);
@@ -2444,6 +2824,14 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_antigravity);
     RUN_TEST(cli_detect_agents_finds_kilocode);
     RUN_TEST(cli_detect_agents_finds_kiro);
+    RUN_TEST(cli_detect_agents_finds_opencode_config);
+    RUN_TEST(cli_detect_agents_finds_opencode_config_env_override);
+    RUN_TEST(cli_cmd_install_only_opencode_dry_run);
+    RUN_TEST(cli_cmd_install_config_only_skips_path_output);
+#ifdef _WIN32
+    RUN_TEST(cli_cmd_install_claude_windows_migrates_legacy_hooks);
+#endif
+    RUN_TEST(cli_cmd_uninstall_only_opencode_dry_run);
     RUN_TEST(cli_detect_agents_none_found);
 
     /* Codex MCP config upsert (3 tests — group B) */
@@ -2457,6 +2845,9 @@ SUITE(cli) {
     /* OpenCode MCP config upsert (2 tests — group B) */
     RUN_TEST(cli_upsert_opencode_mcp_fresh);
     RUN_TEST(cli_upsert_opencode_mcp_existing);
+    RUN_TEST(cli_upsert_opencode_instructions_ref_fresh);
+    RUN_TEST(cli_upsert_opencode_instructions_ref_preserves_existing);
+    RUN_TEST(cli_remove_opencode_instructions_ref);
 
     /* Antigravity MCP config upsert (2 tests — group B) */
     RUN_TEST(cli_upsert_antigravity_mcp_fresh);

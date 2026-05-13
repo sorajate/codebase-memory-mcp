@@ -17,6 +17,9 @@
 #include "foundation/compat_thread.h"
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#endif
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
@@ -4665,12 +4668,19 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
      * and the rewrite could land in the same tick as the original write. */
     struct stat mst;
     if (stat(path, &mst) == 0) {
+#ifdef _WIN32
+        struct _utimbuf times;
+        times.actime = mst.st_atime;
+        times.modtime = mst.st_mtime + 5;
+        _utime(path, &times);
+#else
         struct timespec times[2];
         times[0].tv_sec = mst.st_atime;
         times[0].tv_nsec = 0;
         times[1].tv_sec = mst.st_mtime + 5;
         times[1].tv_nsec = 0;
         utimensat(AT_FDCWD, path, times, 0);
+#endif
     }
 
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);

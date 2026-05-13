@@ -13,6 +13,7 @@
 #include "foundation/constants.h"
 
 enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, PL_WAL_BUF = 1040 };
+enum { CBM_PIPELINE_SOURCE_DIRTY = -2 };
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
@@ -30,6 +31,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
+#include "foundation/process_lock.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -38,6 +40,15 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <time.h>
+#ifdef _WIN32
+#include <process.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <unistd.h>
+#endif
 
 static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
@@ -49,9 +60,28 @@ static inline void *intptr_to_ptr(intptr_t v) {
 /* Prevents concurrent pipeline runs on the same DB file.
  * Atomic spinlock: 0 = free, 1 = locked. */
 static atomic_int g_pipeline_busy = 0;
+static cbm_process_lock_t *g_pipeline_process_lock = NULL;
+
+static void pipeline_lock_path(char *buf, size_t bufsz) {
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir) {
+        dir = cbm_tmpdir();
+    }
+    cbm_mkdir_p(dir, CBM_DIR_PERMS);
+    snprintf(buf, bufsz, "%s/_index.lock", dir);
+}
 
 bool cbm_pipeline_try_lock(void) {
-    return atomic_exchange(&g_pipeline_busy, 1) == 0;
+    if (atomic_exchange(&g_pipeline_busy, 1) != 0) {
+        return false;
+    }
+    char lock_path[CBM_SZ_1K];
+    pipeline_lock_path(lock_path, sizeof(lock_path));
+    if (cbm_process_lock_try_acquire(lock_path, &g_pipeline_process_lock) != 0) {
+        atomic_store(&g_pipeline_busy, 0);
+        return false;
+    }
+    return true;
 }
 
 #define LOCK_SPIN_NS 100000000 /* 100ms between lock retries */
@@ -61,9 +91,17 @@ void cbm_pipeline_lock(void) {
         struct timespec ts = {0, LOCK_SPIN_NS};
         cbm_nanosleep(&ts, NULL);
     }
+    char lock_path[CBM_SZ_1K];
+    pipeline_lock_path(lock_path, sizeof(lock_path));
+    while (cbm_process_lock_acquire(lock_path, &g_pipeline_process_lock) != 0) {
+        struct timespec ts = {0, LOCK_SPIN_NS};
+        cbm_nanosleep(&ts, NULL);
+    }
 }
 
 void cbm_pipeline_unlock(void) {
+    cbm_process_lock_release(g_pipeline_process_lock);
+    g_pipeline_process_lock = NULL;
     atomic_store(&g_pipeline_busy, 0);
 }
 
@@ -83,6 +121,11 @@ struct cbm_pipeline {
 
     /* User-defined extension overrides (loaded once per run) */
     cbm_userconfig_t *userconfig;
+
+    int source_file_count;
+    int64_t source_mtime_ns;
+    int64_t source_size;
+    bool source_retry_used;
 };
 
 /* ── Global pkgmap (one active pipeline at a time) ─────────────── */
@@ -604,6 +647,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
 /* Try incremental pipeline or delete old DB for reindex.
  * Returns >= 0 if incremental was used (the return code), or -1 to proceed with full. */
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
+    (void)files;
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_NOT_FOUND;
@@ -621,27 +665,19 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
         cbm_store_free_file_hashes(hashes, hash_count);
         cbm_store_close(check_store);
         if (hash_count > 0 && file_count <= hash_count + (hash_count / PAIR_LEN)) {
-            cbm_log_info("pipeline.route", "path", "incremental", "stored_hashes",
+            cbm_log_info("pipeline.route", "path", "incremental_atomic", "stored_hashes",
                          itoa_buf(hash_count));
             int rc = cbm_pipeline_run_incremental(p, db_path, files, file_count);
             free(db_path);
             return rc;
         }
         if (hash_count > 0) {
-            cbm_log_info("pipeline.route", "path", "mode_change_reindex", "stored_hashes",
+            cbm_log_info("pipeline.route", "path", "full_atomic", "stored_hashes",
                          itoa_buf(hash_count), "discovered", itoa_buf(file_count));
         }
     } else if (check_store) {
         cbm_store_close(check_store);
     }
-    cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
-    cbm_unlink(db_path);
-    char wal[PL_WAL_BUF];
-    char shm[PL_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
     free(db_path);
     return CBM_NOT_FOUND;
 }
@@ -658,9 +694,106 @@ static int64_t stat_mtime_ns(const struct stat *fst) {
 #endif
 }
 
+static void source_fingerprint(const cbm_file_info_t *files, int file_count, int *out_count,
+                               int64_t *out_mtime_ns, int64_t *out_size) {
+    int count = 0;
+    int64_t mtime_ns = 0;
+    int64_t size = 0;
+    for (int i = 0; i < file_count; i++) {
+        struct stat fst;
+        if (files[i].path && stat(files[i].path, &fst) == 0) {
+            count++;
+            mtime_ns += stat_mtime_ns(&fst);
+            size += (int64_t)fst.st_size;
+        }
+    }
+    if (out_count) {
+        *out_count = count;
+    }
+    if (out_mtime_ns) {
+        *out_mtime_ns = mtime_ns;
+    }
+    if (out_size) {
+        *out_size = size;
+    }
+}
+
+static void unlink_db_sidecars(const char *db_path) {
+    if (!db_path) {
+        return;
+    }
+    char wal[PL_WAL_BUF];
+    char shm[PL_WAL_BUF];
+    snprintf(wal, sizeof(wal), "%s-wal", db_path);
+    snprintf(shm, sizeof(shm), "%s-shm", db_path);
+    cbm_unlink(wal);
+    cbm_unlink(shm);
+}
+
+static void cleanup_temp_db(const char *db_path) {
+    if (!db_path) {
+        return;
+    }
+    cbm_unlink(db_path);
+    unlink_db_sidecars(db_path);
+}
+
+static int make_temp_db_path(const char *final_path, char *tmp_path, size_t tmp_path_sz) {
+    static atomic_uint counter = 0;
+    if (!final_path || !tmp_path) {
+        return CBM_NOT_FOUND;
+    }
+#ifdef _WIN32
+    int pid = _getpid();
+#else
+    int pid = (int)getpid();
+#endif
+    unsigned int n = atomic_fetch_add(&counter, 1);
+    int wrote = snprintf(tmp_path, tmp_path_sz, "%s.tmp.%d.%u", final_path, pid, n);
+    return (wrote > 0 && (size_t)wrote < tmp_path_sz) ? 0 : CBM_NOT_FOUND;
+}
+
+static int atomic_replace_db(const char *tmp_path, const char *final_path) {
+    if (!tmp_path || !final_path) {
+        return CBM_NOT_FOUND;
+    }
+    unlink_db_sidecars(final_path);
+#ifdef _WIN32
+    if (!MoveFileExA(tmp_path, final_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return CBM_NOT_FOUND;
+    }
+#else
+    if (rename(tmp_path, final_path) != 0) {
+        return CBM_NOT_FOUND;
+    }
+#endif
+    unlink_db_sidecars(final_path);
+    return 0;
+}
+
+static int validate_db_file(const char *db_path) {
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store) {
+        return CBM_NOT_FOUND;
+    }
+    bool ok = cbm_store_check_integrity(store);
+    cbm_store_close(store);
+    return ok ? 0 : CBM_NOT_FOUND;
+}
+
 /* Dump graph to SQLite and persist file hashes for incremental indexing. */
 static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *files, int file_count,
                                    struct timespec *t) {
+    int current_count = 0;
+    int64_t current_mtime_ns = 0;
+    int64_t current_size = 0;
+    source_fingerprint(files, file_count, &current_count, &current_mtime_ns, &current_size);
+    if (current_count != p->source_file_count || current_mtime_ns != p->source_mtime_ns ||
+        current_size != p->source_size) {
+        cbm_log_warn("pipeline.source_dirty", "action", "retry_once");
+        return CBM_PIPELINE_SOURCE_DIRTY;
+    }
+
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     char db_path[CBM_SZ_1K];
     if (p->db_path) {
@@ -679,13 +812,20 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         *last_slash = '\0';
         cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
     }
-    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
+    char tmp_path[CBM_SZ_1K];
+    if (make_temp_db_path(db_path, tmp_path, sizeof(tmp_path)) != 0) {
+        return CBM_NOT_FOUND;
+    }
+    cleanup_temp_db(tmp_path);
+
+    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, tmp_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
+        cleanup_temp_db(tmp_path);
         return rc;
     }
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
-    cbm_store_t *hash_store = cbm_store_open_path(db_path);
+    cbm_store_t *hash_store = cbm_store_open_path(tmp_path);
     if (hash_store) {
         cbm_store_delete_file_hashes(hash_store, p->project_name);
         for (int i = 0; i < file_count; i++) {
@@ -711,8 +851,28 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
                            "SELECT id, name, qualified_name, label, file_path FROM nodes;");
         }
 
+        cbm_store_checkpoint(hash_store);
+        cbm_store_exec(hash_store, "PRAGMA wal_checkpoint(FULL);");
+        cbm_store_exec(hash_store, "PRAGMA journal_mode = DELETE;");
         cbm_store_close(hash_store);
         cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
+    } else {
+        cleanup_temp_db(tmp_path);
+        return CBM_NOT_FOUND;
+    }
+
+    if (validate_db_file(tmp_path) != 0) {
+        cbm_log_error("pipeline.err", "phase", "validate_temp_db");
+        cleanup_temp_db(tmp_path);
+        return CBM_NOT_FOUND;
+    }
+    unlink_db_sidecars(tmp_path);
+
+    rc = atomic_replace_db(tmp_path, db_path);
+    if (rc != 0) {
+        cbm_log_error("pipeline.err", "phase", "publish", "reason", "db_busy_or_replace_failed");
+        cleanup_temp_db(tmp_path);
+        return rc;
     }
 
     /* Export persistent artifact if enabled */
@@ -871,6 +1031,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         rc = CBM_NOT_FOUND;
         goto cleanup;
     }
+    source_fingerprint(files, file_count, &p->source_file_count, &p->source_mtime_ns,
+                       &p->source_size);
 
     /* Check for existing DB → try incremental or delete for reindex */
     rc = try_incremental_or_delete_db(p, files, file_count);
@@ -927,5 +1089,11 @@ cleanup:
     cbm_set_user_lang_config(NULL);
     cbm_userconfig_free(p->userconfig);
     p->userconfig = NULL;
+    if (rc == CBM_PIPELINE_SOURCE_DIRTY && !p->source_retry_used) {
+        p->source_retry_used = true;
+        cbm_log_warn("pipeline.retry", "reason", "source_dirty");
+        return cbm_pipeline_run(p);
+    }
+    p->source_retry_used = false;
     return rc;
 }

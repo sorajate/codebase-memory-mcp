@@ -16,10 +16,11 @@
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
-/* pipeline.h no longer needed — indexing runs as subprocess */
+#include "pipeline/pipeline.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 
 #include <mongoose/mongoose.h>
@@ -855,12 +856,16 @@ static void handle_delete_project(struct mg_connection *c, struct mg_http_messag
     char db_path[1024];
     db_path_for_project(name, db_path, sizeof(db_path));
 
+    cbm_pipeline_lock();
+
     if (!cbm_file_exists(db_path)) {
+        cbm_pipeline_unlock();
         mg_http_reply(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
 
-    if (unlink(db_path) != 0) {
+    if (cbm_unlink(db_path) != 0) {
+        cbm_pipeline_unlock();
         mg_http_reply(c, 500, g_cors_json, "{\"error\":\"failed to delete\"}");
         return;
     }
@@ -869,8 +874,10 @@ static void handle_delete_project(struct mg_connection *c, struct mg_http_messag
     char wal_path[1040], shm_path[1040];
     snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
     snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
-    (void)unlink(wal_path);
-    (void)unlink(shm_path);
+    (void)cbm_unlink(wal_path);
+    (void)cbm_unlink(shm_path);
+
+    cbm_pipeline_unlock();
 
     cbm_log_info("ui.project.deleted", "name", name);
     mg_http_reply(c, 200, g_cors_json, "{\"deleted\":true}");

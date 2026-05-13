@@ -141,6 +141,10 @@ int cbm_upsert_opencode_mcp(const char *binary_path, const char *config_path);
 /* Remove CMM MCP entry from opencode.json. Returns 0 on success. */
 int cbm_remove_opencode_mcp(const char *config_path);
 
+/* OpenCode: add/remove an instructions file reference in opencode.json. */
+int cbm_upsert_opencode_instructions_ref(const char *config_path, const char *instr_path);
+int cbm_remove_opencode_instructions_ref(const char *config_path, const char *instr_path);
+
 /* Antigravity: upsert MCP entry in ~/.gemini/antigravity/mcp_config.json.
  * Returns 0 on success. */
 int cbm_upsert_antigravity_mcp(const char *binary_path, const char *config_path);
@@ -181,6 +185,11 @@ int cbm_upsert_gemini_hooks(const char *settings_path);
 /* Remove our BeforeTool hook from Gemini settings.json.
  * Returns 0 on success. */
 int cbm_remove_gemini_hooks(const char *settings_path);
+
+/* ── Hook subcommands ──────────────────────────────────────────── */
+
+/* Handle internal hook entry points used by Claude/Cursor hook commands. */
+int cbm_cmd_hook(int argc, char **argv);
 
 /* ── PATH management ──────────────────────────────────────────── */
 

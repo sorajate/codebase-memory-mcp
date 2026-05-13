@@ -7,6 +7,7 @@
  * indirectly via the integration test that builds a tmp tsconfig tree.
  */
 #include "test_framework.h"
+#include "../src/foundation/compat.h"
 #include "../src/pipeline/path_alias.h"
 
 #include <stdarg.h>
@@ -228,15 +229,16 @@ static int write_file(const char *path, const char *content) {
 }
 
 TEST(path_alias_loader_monorepo) {
-    char tmpl[] = "/tmp/cbm_palias_XXXXXX";
-    char *root = mkdtemp(tmpl);
+    char tmpl[256];
+    snprintf(tmpl, sizeof(tmpl), "%s/cbm_palias_XXXXXX", cbm_tmpdir());
+    char *root = cbm_mkdtemp(tmpl);
     ASSERT_NOT_NULL(root);
 
     char sub[512];
     snprintf(sub, sizeof(sub), "%s/apps", root);
-    mkdir(sub, 0755);
+    cbm_mkdir(sub);
     snprintf(sub, sizeof(sub), "%s/apps/manager", root);
-    mkdir(sub, 0755);
+    cbm_mkdir(sub);
 
     char path[512];
     snprintf(path, sizeof(path), "%s/tsconfig.json", root);
@@ -290,8 +292,9 @@ TEST(path_alias_loader_monorepo) {
 /* ── Loader returns NULL when no configs found ─────────────────── */
 
 TEST(path_alias_loader_no_configs) {
-    char tmpl[] = "/tmp/cbm_palias_empty_XXXXXX";
-    char *root = mkdtemp(tmpl);
+    char tmpl[256];
+    snprintf(tmpl, sizeof(tmpl), "%s/cbm_palias_empty_XXXXXX", cbm_tmpdir());
+    char *root = cbm_mkdtemp(tmpl);
     ASSERT_NOT_NULL(root);
 
     cbm_path_alias_collection_t *coll = cbm_load_path_aliases(root);

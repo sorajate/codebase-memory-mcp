@@ -58,6 +58,7 @@ enum {
 #include "pipeline/artifact.h"
 
 #ifdef _WIN32
+#include <io.h>
 #include <process.h>
 #define getpid _getpid
 #else
@@ -593,6 +594,8 @@ struct cbm_mcp_server {
     bool owns_store;                /* true if we opened the store */
     char *current_project;          /* which project store is open for (heap) */
     time_t store_last_used;         /* last time resolve_store was called for a named project */
+    time_t store_mtime;             /* cached DB mtime when store was opened */
+    int64_t store_size;             /* cached DB size when store was opened */
     char update_notice[CBM_SZ_256]; /* one-shot update notice, cleared after first injection */
     bool update_checked;            /* true after background check has been launched */
     cbm_thread_t update_tid;        /* background update check thread */
@@ -672,6 +675,8 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     free(srv);
 }
 
+static void reset_store_file_metadata(cbm_mcp_server_t *srv);
+
 /* ── Idle store eviction ──────────────────────────────────────── */
 
 void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
@@ -696,6 +701,7 @@ void cbm_mcp_server_evict_idle(cbm_mcp_server_t *srv, int timeout_s) {
     free(srv->current_project);
     srv->current_project = NULL;
     srv->store_last_used = 0;
+    reset_store_file_metadata(srv);
 }
 
 bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
@@ -704,6 +710,14 @@ bool cbm_mcp_server_has_cached_store(cbm_mcp_server_t *srv) {
 
 cbm_pipeline_t *cbm_mcp_server_active_pipeline(cbm_mcp_server_t *srv) {
     return srv ? srv->active_pipeline : NULL;
+}
+
+static void reset_store_file_metadata(cbm_mcp_server_t *srv) {
+    if (!srv) {
+        return;
+    }
+    srv->store_mtime = 0;
+    srv->store_size = 0;
 }
 
 /* ── Cache dir + project DB path helpers ───────────────────────── */
@@ -726,6 +740,20 @@ static const char *project_db_path(const char *project, char *buf, size_t bufsz)
     return buf;
 }
 
+static bool stat_store_file(const char *path, time_t *mtime, int64_t *size) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) {
+        return false;
+    }
+    if (mtime) {
+        *mtime = st.st_mtime;
+    }
+    if (size) {
+        *size = (int64_t)st.st_size;
+    }
+    return true;
+}
+
 /* ── Store resolution ──────────────────────────────────────────── */
 
 /* Open the right project's .db file for query tools.
@@ -738,9 +766,26 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
 
     srv->store_last_used = time(NULL);
 
+    char path[CBM_SZ_1K];
+    project_db_path(project, path, sizeof(path));
+
     /* Already open for this project? */
     if (srv->current_project && strcmp(srv->current_project, project) == 0 && srv->store) {
-        return srv->store;
+        if (srv->store_mtime == 0 && srv->store_size == 0) {
+            return srv->store;
+        }
+        time_t mtime = 0;
+        int64_t size = 0;
+        if (!stat_store_file(path, &mtime, &size) || mtime != srv->store_mtime ||
+            size != srv->store_size) {
+            cbm_store_close(srv->store);
+            srv->store = NULL;
+            free(srv->current_project);
+            srv->current_project = NULL;
+            reset_store_file_metadata(srv);
+        } else {
+            return srv->store;
+        }
     }
 
     /* Close old store */
@@ -748,11 +793,10 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         cbm_store_close(srv->store);
         srv->store = NULL;
     }
+    reset_store_file_metadata(srv);
 
     /* Open project's .db file — query-only open (no SQLITE_OPEN_CREATE) to
      * prevent ghost .db file creation for unknown/unindexed projects. */
-    char path[CBM_SZ_1K];
-    project_db_path(project, path, sizeof(path));
     srv->store = cbm_store_open_path_query(path);
     if (srv->store) {
         /* Check DB integrity — auto-clean corrupt databases */
@@ -761,6 +805,7 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
                           "deleting corrupt db — re-index required");
             cbm_store_close(srv->store);
             srv->store = NULL;
+            reset_store_file_metadata(srv);
             /* Delete the corrupt DB + WAL/SHM files */
             cbm_unlink(path);
             char wal_path[MCP_FIELD_SIZE];
@@ -780,9 +825,16 @@ static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
         if (cbm_store_get_project(srv->store, project, &proj_verify) != CBM_STORE_OK) {
             cbm_store_close(srv->store);
             srv->store = NULL;
+            reset_store_file_metadata(srv);
             return NULL;
         }
         cbm_project_free_fields(&proj_verify);
+        if (!stat_store_file(path, &srv->store_mtime, &srv->store_size)) {
+            cbm_store_close(srv->store);
+            srv->store = NULL;
+            reset_store_file_metadata(srv);
+            return NULL;
+        }
         srv->owns_store = true;
         free(srv->current_project);
         srv->current_project = heap_strdup(project);
@@ -1701,6 +1753,7 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
         }
         free(srv->current_project);
         srv->current_project = NULL;
+        reset_store_file_metadata(srv);
     }
 
     /* Wait for any in-progress pipeline to finish before deleting */
@@ -2547,6 +2600,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(srv->current_project);
     srv->current_project = NULL;
+    reset_store_file_metadata(srv);
 
     /* Serialize pipeline runs to prevent concurrent writes.
      * Track active pipeline so signal handler and notifications/cancelled
@@ -2567,6 +2621,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
     free(srv->current_project);
     srv->current_project = NULL;
+    reset_store_file_metadata(srv);
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
@@ -2971,45 +3026,11 @@ static int search_result_cmp(const void *a, const void *b) {
     return rb->score - ra->score; /* descending */
 }
 
-/* Build the grep/search command string based on scoped vs recursive mode.
- * On Windows, uses PowerShell Select-String with tab-delimited output.
- * On POSIX, uses grep with colon-delimited output. */
+#ifndef _WIN32
+/* Build the POSIX grep/search command string based on scoped vs recursive mode. */
 static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
                            const char *file_pattern, const char *tmpfile, const char *filelist,
                            const char *root_path) {
-#ifdef _WIN32
-    const char *sm = use_regex ? "" : " -SimpleMatch";
-    if (scoped) {
-        if (file_pattern) {
-            snprintf(cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content '%s'; "
-                "Get-Content '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction SilentlyContinue }"
-                " | Where-Object { $_.Path -like '*%s' }"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm, file_pattern);
-        } else {
-            snprintf(cmd, cmd_sz,
-                "powershell -Command \"$pat = Get-Content '%s'; "
-                "Get-Content '%s' | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s -ErrorAction SilentlyContinue }"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                tmpfile, filelist, sm);
-        }
-    } else {
-        if (file_pattern) {
-            snprintf(cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -Include '%s' -File -ErrorAction SilentlyContinue"
-                " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, file_pattern, tmpfile, sm);
-        } else {
-            snprintf(cmd, cmd_sz,
-                "powershell -Command \"Get-ChildItem -Recurse -Path '%s\\*' -File -ErrorAction SilentlyContinue"
-                " | Select-String -Pattern (Get-Content '%s')%s -ErrorAction SilentlyContinue"
-                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                root_path, tmpfile, sm);
-        }
-    }
-#else
     const char *flag = use_regex ? "-E" : "-F";
     if (scoped) {
         if (file_pattern) {
@@ -3027,8 +3048,8 @@ static void build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped
             snprintf(cmd, cmd_sz, "grep -rn %s -f '%s' '%s' 2>/dev/null", flag, tmpfile, root_path);
         }
     }
-#endif
 }
+#endif
 
 /* Build deduplicated file list from search results + raw matches. */
 static yyjson_mut_val *build_dedup_files_array(yyjson_mut_doc *doc, search_result_t *sr,
@@ -3231,6 +3252,7 @@ static const char *strip_root_prefix(const char *path, const char *root, size_t 
     return p;
 }
 
+#ifndef _WIN32
 static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_t root_len,
                                           bool has_path_filter, cbm_regex_t *path_regex,
                                           int grep_limit, int *out_count) {
@@ -3287,6 +3309,228 @@ static grep_match_t *collect_grep_matches(FILE *fp, const char *root_path, size_
     *out_count = gm_count;
     return gm;
 }
+#endif
+
+#ifdef _WIN32
+static bool wildcard_match_ci(const char *pattern, const char *text) {
+    while (*pattern) {
+        if (*pattern == '*') {
+            pattern++;
+            if (*pattern == '\0') {
+                return true;
+            }
+            while (*text) {
+                if (wildcard_match_ci(pattern, text)) {
+                    return true;
+                }
+                text++;
+            }
+            return false;
+        }
+        if (*pattern == '?') {
+            if (*text == '\0') {
+                return false;
+            }
+            pattern++;
+            text++;
+            continue;
+        }
+        char pc = *pattern;
+        char tc = *text;
+        if (pc >= 'A' && pc <= 'Z') {
+            pc = (char)(pc - 'A' + 'a');
+        }
+        if (tc >= 'A' && tc <= 'Z') {
+            tc = (char)(tc - 'A' + 'a');
+        }
+        if (pc != tc) {
+            return false;
+        }
+        pattern++;
+        text++;
+    }
+    return *text == '\0';
+}
+
+static const char *path_basename(const char *path) {
+    const char *base = path;
+    for (const char *p = path; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    return base;
+}
+
+static bool search_file_pattern_matches(const char *file, const char *file_pattern) {
+    if (!file_pattern || file_pattern[0] == '\0') {
+        return true;
+    }
+    char normalized[CBM_SZ_512];
+    snprintf(normalized, sizeof(normalized), "%s", file);
+    cbm_normalize_path_sep(normalized);
+    const char *target = (strchr(file_pattern, '/') || strchr(file_pattern, '\\'))
+                             ? normalized
+                             : path_basename(normalized);
+    return wildcard_match_ci(file_pattern, target);
+}
+
+static void add_windows_match(grep_match_t **gm, int *gm_count, int *gm_cap, int grep_limit,
+                              const char *file, int line_no, const char *content) {
+    if (*gm_count >= grep_limit) {
+        return;
+    }
+    safe_grow(*gm, *gm_count, *gm_cap, PAIR_LEN);
+    if (!*gm) {
+        *gm_count = 0;
+        *gm_cap = 0;
+        return;
+    }
+    snprintf((*gm)[*gm_count].file, sizeof((*gm)[0].file), "%s", file);
+    (*gm)[*gm_count].line = line_no;
+    snprintf((*gm)[*gm_count].content, sizeof((*gm)[0].content), "%s", content);
+    sanitize_ascii((*gm)[*gm_count].content);
+    (*gm_count)++;
+}
+
+static bool search_line_matches(const char *pattern, bool use_regex, cbm_regex_t *regex,
+                                const char *line) {
+    if (use_regex) {
+        return cbm_regexec(regex, line, 0, NULL, 0) == CBM_REG_OK;
+    }
+    return strstr(line, pattern) != NULL;
+}
+
+static void scan_windows_file(const char *abs_path, const char *rel_path, const char *pattern,
+                              bool use_regex, cbm_regex_t *regex, const char *file_pattern,
+                              bool has_path_filter, cbm_regex_t *path_regex, int grep_limit,
+                              grep_match_t **gm, int *gm_count, int *gm_cap) {
+    if (!search_file_pattern_matches(rel_path, file_pattern)) {
+        return;
+    }
+    if (has_path_filter && cbm_regexec(path_regex, rel_path, 0, NULL, 0) != CBM_REG_OK) {
+        return;
+    }
+
+    FILE *fp = fopen(abs_path, "rb");
+    if (!fp) {
+        return;
+    }
+    char line[CBM_SZ_2K];
+    int line_no = 0;
+    while (fgets(line, sizeof(line), fp) && *gm_count < grep_limit) {
+        line_no++;
+        size_t len = strlen(line);
+        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
+            line[--len] = '\0';
+        }
+        if (search_line_matches(pattern, use_regex, regex, line)) {
+            add_windows_match(gm, gm_count, gm_cap, grep_limit, rel_path, line_no, line);
+        }
+    }
+    fclose(fp);
+}
+
+static void scan_windows_tree(const char *root_path, const char *dir, const char *pattern,
+                              bool use_regex, cbm_regex_t *regex, const char *file_pattern,
+                              bool has_path_filter, cbm_regex_t *path_regex, int grep_limit,
+                              grep_match_t **gm, int *gm_count, int *gm_cap) {
+    if (*gm_count >= grep_limit) {
+        return;
+    }
+    char glob[CBM_SZ_1K];
+    snprintf(glob, sizeof(glob), "%s/*", dir);
+
+    struct _finddata_t ent;
+    intptr_t handle = _findfirst(glob, &ent);
+    if (handle == CBM_NOT_FOUND) {
+        return;
+    }
+    do {
+        if (strcmp(ent.name, ".") == 0 || strcmp(ent.name, "..") == 0) {
+            continue;
+        }
+        char abs_path[CBM_SZ_1K];
+        snprintf(abs_path, sizeof(abs_path), "%s/%s", dir, ent.name);
+        if (ent.attrib & _A_SUBDIR) {
+            scan_windows_tree(root_path, abs_path, pattern, use_regex, regex, file_pattern,
+                              has_path_filter, path_regex, grep_limit, gm, gm_count, gm_cap);
+        } else {
+            char norm_abs[CBM_SZ_1K];
+            char norm_root[CBM_SZ_1K];
+            snprintf(norm_abs, sizeof(norm_abs), "%s", abs_path);
+            snprintf(norm_root, sizeof(norm_root), "%s", root_path);
+            cbm_normalize_path_sep(norm_abs);
+            cbm_normalize_path_sep(norm_root);
+            const char *rel = strip_root_prefix(norm_abs, norm_root, strlen(norm_root));
+            scan_windows_file(abs_path, rel, pattern, use_regex, regex, file_pattern,
+                              has_path_filter, path_regex, grep_limit, gm, gm_count, gm_cap);
+        }
+    } while (*gm_count < grep_limit && _findnext(handle, &ent) == 0);
+    _findclose(handle);
+}
+
+static grep_match_t *collect_windows_matches(const char *root_path, const char *pattern,
+                                             bool use_regex, bool scoped, const char *file_pattern,
+                                             const char *filelist, bool has_path_filter,
+                                             cbm_regex_t *path_regex, int grep_limit,
+                                             int *out_count) {
+    int gm_cap = CBM_SZ_64;
+    int gm_count = 0;
+    grep_match_t *gm = malloc(gm_cap * sizeof(grep_match_t));
+    if (!gm) {
+        *out_count = 0;
+        return NULL;
+    }
+
+    cbm_regex_t regex;
+    bool regex_compiled = false;
+    if (use_regex) {
+        if (cbm_regcomp(&regex, pattern, CBM_REG_EXTENDED | CBM_REG_NOSUB) != CBM_REG_OK) {
+            *out_count = 0;
+            return gm;
+        }
+        regex_compiled = true;
+    }
+
+    char norm_root[CBM_SZ_1K];
+    snprintf(norm_root, sizeof(norm_root), "%s", root_path);
+    cbm_normalize_path_sep(norm_root);
+
+    if (scoped) {
+        FILE *fl = fopen(filelist, "rb");
+        if (fl) {
+            char abs_path[CBM_SZ_1K];
+            while (fgets(abs_path, sizeof(abs_path), fl) && gm_count < grep_limit) {
+                size_t len = strlen(abs_path);
+                while (len > 0 &&
+                       (abs_path[len - SKIP_ONE] == '\n' || abs_path[len - SKIP_ONE] == '\r')) {
+                    abs_path[--len] = '\0';
+                }
+                if (len == 0) {
+                    continue;
+                }
+                char norm_abs[CBM_SZ_1K];
+                snprintf(norm_abs, sizeof(norm_abs), "%s", abs_path);
+                cbm_normalize_path_sep(norm_abs);
+                const char *rel = strip_root_prefix(norm_abs, norm_root, strlen(norm_root));
+                scan_windows_file(abs_path, rel, pattern, use_regex, &regex, file_pattern,
+                                  has_path_filter, path_regex, grep_limit, &gm, &gm_count, &gm_cap);
+            }
+            fclose(fl);
+        }
+    } else {
+        scan_windows_tree(root_path, root_path, pattern, use_regex, &regex, file_pattern,
+                          has_path_filter, path_regex, grep_limit, &gm, &gm_count, &gm_cap);
+    }
+
+    if (regex_compiled) {
+        cbm_regfree(&regex);
+    }
+    *out_count = gm_count;
+    return gm;
+}
+#endif
 
 /* Find the tightest node containing a line in a file. Returns index or -1. */
 static int find_tightest_node(cbm_node_t *nodes, int count, int line) {
@@ -3585,6 +3829,16 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     scoped = write_scoped_filelist(srv, project, root_path, filelist);
 
+    int gm_count = 0;
+#ifdef _WIN32
+    grep_match_t *gm = collect_windows_matches(root_path, pattern, use_regex, scoped, file_pattern,
+                                               filelist, has_path_filter, &path_regex, grep_limit,
+                                               &gm_count);
+    cbm_unlink(tmpfile);
+    if (scoped) {
+        cbm_unlink(filelist);
+    }
+#else
     char cmd[CBM_SZ_4K];
     build_grep_cmd(cmd, sizeof(cmd), use_regex, scoped, file_pattern, tmpfile, filelist, root_path);
 
@@ -3602,7 +3856,6 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     }
 
     /* Collect grep matches into array */
-    int gm_count = 0;
     grep_match_t *gm = collect_grep_matches(fp, root_path, strlen(root_path), has_path_filter,
                                             &path_regex, grep_limit, &gm_count);
     cbm_pclose(fp);
@@ -3610,6 +3863,7 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
     if (scoped) {
         cbm_unlink(filelist);
     }
+#endif
 
     /* ── Phase 2+3: Block expansion + graph ranking ──────────── */
     /* Sort grep matches by file for contiguous processing.

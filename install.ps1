@@ -21,6 +21,16 @@ if (-not $BaseUrl.StartsWith("https://") -and -not $BaseUrl.StartsWith("http://l
     exit 1
 }
 
+function Remove-ClaudeLegacyHookFiles {
+    $hooksDir = Join-Path $HOME ".claude\hooks"
+    foreach ($name in @("cbm-code-discovery-gate", "cbm-session-reminder")) {
+        $hookPath = Join-Path $hooksDir $name
+        if (Test-Path $hookPath) {
+            Remove-Item $hookPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 # Detect variant from args (--ui or --standard)
 $Variant = "standard"
 $SkipConfig = $false
@@ -133,6 +143,7 @@ if ($SkipConfig) {
     Write-Host "Configuring coding agents..."
     try {
         & $Dest install -y 2>&1 | Write-Host
+        Remove-ClaudeLegacyHookFiles
     } catch {
         Write-Host "Agent configuration failed (non-fatal)."
         Write-Host "Run manually: codebase-memory-mcp install"
